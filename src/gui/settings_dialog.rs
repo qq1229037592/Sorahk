@@ -1319,6 +1319,31 @@ impl SorahkGui {
                                                         });
                                                     });
                                                 }
+                                                // Note edit for existing mapping
+                                                ui.add_space(2.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(30.0);
+                                                    ui.label(
+                                                        egui::RichText::new(t.note_label())
+                                                            .size(12.0)
+                                                            .color(if self.dark_mode {
+                                                                egui::Color32::from_rgb(180, 180, 180)
+                                                            } else {
+                                                                egui::Color32::from_rgb(100, 100, 100)
+                                                            }),
+                                                    );
+                                                    let note_edit = egui::TextEdit::singleline(
+                                                        &mut mapping.note,
+                                                    )
+                                                    .background_color(if self.dark_mode {
+                                                        egui::Color32::from_rgb(50, 50, 50)
+                                                    } else {
+                                                        egui::Color32::from_rgb(220, 220, 220)
+                                                    })
+                                                    .hint_text(t.note_hint())
+                                                    .desired_width(200.0);
+                                                    ui.add(note_edit);
+                                                });
                                                 ui.add_space(4.0);
                                             }
 
