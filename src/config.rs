@@ -82,34 +82,6 @@ pub struct AppConfig {
     pub language: Language,
     /// Toggle hotkey name
     pub switch_key: String,
-    /// Hotkey used to finalize a sequence capture in the settings dialog.
-    /// Pressing this key during recording stops the capture, and the key
-    /// itself is not added to the sequence.
-    #[serde(default = "default_sequence_finalize_key")]
-    pub sequence_finalize_key: String,
-    /// Analog-stick deadzone applied to every XInput device.
-    /// Values below the absolute threshold are treated as neutral.
-    #[serde(default = "default_xinput_stick_deadzone")]
-    pub xinput_stick_deadzone: i16,
-    /// Trigger threshold applied to every XInput device.
-    /// Trigger values at or below the threshold are treated as released.
-    #[serde(default = "default_xinput_trigger_threshold")]
-    pub xinput_trigger_threshold: u8,
-    /// Minimum single-event delta in pixels required for a mouse event
-    /// to count toward the motion accumulator. Acts as a noise floor that
-    /// filters out hardware jitter and hand tremor below the threshold.
-    #[serde(default = "default_mouse_move_per_event_min_px")]
-    pub mouse_move_per_event_min_px: u32,
-    /// Accumulated motion in pixels required to fire a directional trigger.
-    /// Only events that pass `mouse_move_per_event_min_px` contribute to
-    /// this accumulator.
-    #[serde(default = "default_mouse_move_min_trigger_px")]
-    pub mouse_move_min_trigger_px: u32,
-    /// Reverse-direction distance in pixels that must accumulate before
-    /// the same direction can fire again. Lets the user double-flick in
-    /// one direction without spamming on a single continuous swipe.
-    #[serde(default = "default_mouse_move_rearm_px")]
-    pub mouse_move_rearm_px: u32,
     /// Key mapping configurations
     pub mappings: Vec<KeyMapping>,
     /// Input timeout in milliseconds
@@ -139,6 +111,12 @@ pub struct AppConfig {
     /// Device API preferences (VID:PID -> API preference)
     #[serde(default)]
     pub device_api_preferences: HashMap<String, DeviceApiPreference>,
+    /// Saved presets (named mapping snapshots)
+    #[serde(default)]
+    pub presets: Vec<Preset>,
+    /// Currently active preset name (empty = none)
+    #[serde(default)]
+    pub current_preset: String,
 }
 
 /// HID device baseline configuration for button state detection.
@@ -150,25 +128,25 @@ pub struct HidDeviceBaseline {
     pub baseline_data: Vec<u8>,
 }
 
+/// Preset configuration storing a named snapshot of mappings.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Preset {
+    /// Preset display name
+    pub name: String,
+    /// Key mappings included in this preset
+    #[serde(default)]
+    pub mappings: Vec<KeyMapping>,
+}
+
 /// Key mapping configuration for trigger-target pairs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct KeyMapping {
-    /// Trigger key name (single key or combo)
+    /// Trigger key name
     pub trigger_key: String,
-    /// Input sequence for combo triggers (e.g., "↓,→,A")
-    /// If set, this takes precedence over trigger_key for matching
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trigger_sequence: Option<String>,
-    /// Time window for sequence completion in milliseconds
-    #[serde(default = "default_sequence_window")]
-    pub sequence_window_ms: u64,
     /// Target keys to send (supports multiple keys for simultaneous press)
     /// Uses SmallVec with inline capacity of 4 to reduce heap allocations for common cases
     #[serde(default = "default_target_keys")]
     pub target_keys: SmallVec<[String; 4]>,
-    /// Target mode: 0=Single, 1=Multi (simultaneous), 2=Sequence (sequential)
-    #[serde(default)]
-    pub target_mode: u8,
     /// Optional override for repeat interval
     #[serde(default)]
     pub interval: Option<u64>,
@@ -181,15 +159,9 @@ pub struct KeyMapping {
     /// Mouse move speed in pixels per move (only for mouse movement)
     #[serde(default = "default_move_speed")]
     pub move_speed: i32,
-    /// 0-based positions within `target_keys` that stay pressed after
-    /// the body plays. Values past `target_keys.len()` or 16 are ignored
-    /// at runtime.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hold_indices: Option<SmallVec<[u8; 4]>>,
-    /// Extra key names pressed and held after the body completes. Mouse
-    /// movement and scroll names fire one edge event per pass.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub append_keys: Option<SmallVec<[String; 4]>>,
+    /// User note/remark for this mapping
+    #[serde(default)]
+    pub note: String,
 }
 
 fn default_move_speed() -> i32 {
@@ -204,41 +176,22 @@ fn default_target_keys() -> SmallVec<[String; 4]> {
     SmallVec::new()
 }
 
-fn default_sequence_window() -> u64 {
-    500 // 500ms default window for sequence completion
-}
-
 impl KeyMapping {
-    /// Checks if this mapping uses sequence trigger
-    #[inline]
-    pub fn is_sequence_trigger(&self) -> bool {
-        self.trigger_sequence.is_some()
-    }
-
-    /// Gets the sequence string if available
-    #[inline]
-    pub fn sequence_string(&self) -> Option<&str> {
-        self.trigger_sequence.as_deref()
-    }
-
     /// Gets the target keys slice
     pub fn get_target_keys(&self) -> &[String] {
         &self.target_keys
     }
 
-    /// Adds a target key (sequence mode allows duplicates)
+    /// Adds a target key
     pub fn add_target_key(&mut self, key: String) {
-        // Sequence mode (target_mode == 2) allows duplicates
-        if self.target_mode == 2 || !self.target_keys.contains(&key) {
+        if !self.target_keys.contains(&key) {
             self.target_keys.push(key);
         }
     }
 
-    /// Removes a target key by index
-    pub fn remove_target_key_at(&mut self, index: usize) {
-        if index < self.target_keys.len() {
-            self.target_keys.remove(index);
-        }
+    /// Removes a target key
+    pub fn remove_target_key(&mut self, key: &str) {
+        self.target_keys.retain(|k| k != key);
     }
 
     /// Clears all target keys
@@ -274,24 +227,6 @@ fn default_capture_mode() -> String {
 fn default_xinput_capture_mode() -> String {
     "MostSustained".to_string()
 }
-fn default_sequence_finalize_key() -> String {
-    "RETURN".to_string()
-}
-fn default_xinput_stick_deadzone() -> i16 {
-    7849
-}
-fn default_xinput_trigger_threshold() -> u8 {
-    30
-}
-fn default_mouse_move_per_event_min_px() -> u32 {
-    2
-}
-fn default_mouse_move_min_trigger_px() -> u32 {
-    20
-}
-fn default_mouse_move_rearm_px() -> u32 {
-    10
-}
 
 impl Default for AppConfig {
     /// Creates a default configuration with sensible defaults.
@@ -299,28 +234,18 @@ impl Default for AppConfig {
         Self {
             show_tray_icon: true,
             show_notifications: true,
-            always_on_top: false,
-            dark_mode: false,
+            always_on_top: false, // Default: not always on top for backward compatibility
+            dark_mode: false,     // Default: light theme for backward compatibility
             language: Language::default(),
             switch_key: "DELETE".to_string(),
-            sequence_finalize_key: default_sequence_finalize_key(),
-            xinput_stick_deadzone: default_xinput_stick_deadzone(),
-            xinput_trigger_threshold: default_xinput_trigger_threshold(),
-            mouse_move_per_event_min_px: default_mouse_move_per_event_min_px(),
-            mouse_move_min_trigger_px: default_mouse_move_min_trigger_px(),
-            mouse_move_rearm_px: default_mouse_move_rearm_px(),
             mappings: vec![KeyMapping {
                 trigger_key: "Q".to_string(),
-                trigger_sequence: None,
-                sequence_window_ms: default_sequence_window(),
                 target_keys: SmallVec::from_vec(vec!["Q".to_string()]),
                 interval: None,
                 event_duration: None,
                 turbo_enabled: true,
                 move_speed: 10,
-                target_mode: 0,
-                hold_indices: None,
-                append_keys: None,
+                note: String::new(),
             }],
             input_timeout: default_input_timeout(),
             interval: default_interval(),
@@ -331,52 +256,40 @@ impl Default for AppConfig {
             rawinput_capture_mode: default_capture_mode(),
             xinput_capture_mode: default_xinput_capture_mode(),
             device_api_preferences: HashMap::new(),
+            presets: vec![Preset {
+                name: "无".to_string(),
+                mappings: Vec::new(),
+            }],
+            current_preset: String::new(),
         }
     }
 }
 
 impl AppConfig {
-    /// Loads configuration from file. Missing or incompatible files are
-    /// replaced with the default configuration on disk.
+    /// Loads configuration from file, creating default if not found.
     ///
     /// # Errors
     ///
-    /// Returns an error only when the file cannot be read or written; a
-    /// parse failure resets the file to defaults instead.
+    /// Returns an error if file operations fail.
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let p = path.as_ref();
-        if !p.exists() {
+        if !path.as_ref().exists() {
             let default_config = Self::default();
-            default_config.save_to_file(p)?;
+            default_config.save_to_file(&path)?;
             return Ok(default_config);
         }
-        match Self::load_from_file(p) {
-            Ok(config) => Ok(config),
-            Err(err) => {
-                eprintln!(
-                    "Config at {} failed to parse ({}); rewriting with defaults.",
-                    p.display(),
-                    err
-                );
-                let default_config = Self::default();
-                default_config.save_to_file(p)?;
-                Ok(default_config)
-            }
-        }
+        Self::load_from_file(path)
     }
 
     /// Loads configuration from a TOML file.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read or parsed. Callers
-    /// that want the "reset on incompatible" behaviour should use
-    /// `load_or_create`.
+    /// Returns an error if the file cannot be read or parsed.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let content = fs::read_to_string(path)?;
         let mut config: AppConfig = toml::from_str(&content)?;
 
-        // Clamp minimum timing values so pathological configs stay sane.
+        // Validate configuration
         if config.input_timeout < 2 {
             config.input_timeout = 2;
         }
@@ -387,6 +300,7 @@ impl AppConfig {
             config.event_duration = 2;
         }
 
+        // Deduplicate process whitelist
         config.process_whitelist.sort();
         config.process_whitelist.dedup();
 
@@ -420,15 +334,9 @@ impl AppConfig {
                                            # DiagonalPriority: Prioritizes diagonal stick directions over straight directions\n\
                                            # MostSustained: Captures the most sustained input pattern\n\
                                            # LastStable: Captures the last stable input before release\n\
-                                           # Note: Compile with RUSTFLAGS=\"-C target-feature=+avx2\" for AVX2 optimizations\n\
-             xinput_stick_deadzone = {}    # Analog-stick deadzone applied to all XInput devices (0-32767)\n\
-             xinput_trigger_threshold = {} # Trigger activation threshold applied to all XInput devices (0-255)\n\
-             mouse_move_per_event_min_px = {} # Minimum per-event delta in pixels for a mouse event to count (noise floor)\n\
-             mouse_move_min_trigger_px = {}   # Accumulated pixels required to fire a directional trigger\n\
-             mouse_move_rearm_px = {}         # Reverse-direction distance in pixels before same direction can fire again\n\n\
+                                           # Note: Compile with RUSTFLAGS=\"-C target-feature=+avx2\" for AVX2 optimizations\n\n\
              # ─── Control Settings ───   \n\
-             switch_key = \"{}\"       # Reserved key to toggle SoraHK behavior\n\
-             sequence_finalize_key = \"{}\"  # Key that stops a sequence capture in Settings\n\n\
+             switch_key = \"{}\"       # Reserved key to toggle SoraHK behavior\n\n\
              # ─── Process Whitelist ───\n\
              # Process whitelist (empty = all processes enabled)\n\
              # Only processes in this list will have turbo-fire enabled\n\
@@ -443,17 +351,6 @@ impl AppConfig {
              #   * Keyboard targets: Supports Windows key repeat (holding trigger sends repeated key presses)\n\
              #   * Mouse button targets: Pure follow mode (press follows trigger press, release follows trigger release)\n\
              #   * Note: event_duration is ignored in non-turbo mode\n\n\
-             # ─── Rule Properties (per mapping, any target mode) ───\n\
-             # - hold_indices = [<u8>, ...]  # 0-based positions within target_keys that stay held after the body plays\n\
-             #   * target_mode = 0 / 1 (Single / Multi): body keys press simultaneously; marked indices remain held after duration\n\
-             #   * target_mode = 2 (Sequence): body keys play one-by-one; marked indices only press (no release), so they linger\n\
-             #   * Values >= target_keys.len() or >= 16 are ignored\n\
-             # - append_keys = [\"UP\", \"LSHIFT\", ...]  # extra keys pressed and held after the body\n\
-             #   * Keyboard / mouse-button names remain held until trigger release\n\
-             #   * Mouse-move / mouse-scroll names fire a single edge event per pass\n\
-             # Interaction with turbo_enabled:\n\
-             #   * turbo_enabled = false: body plays once, then hold_indices + append stay held until trigger release\n\
-             #   * turbo_enabled = true:  only the hold_indices subset + append is cycled at interval / duration; body is not replayed\n\n\
              # ─── Key Combo Examples ───\n\
              # Combo key mappings: Use '+' to separate keys\n\
              # - Supports modifier keys: LSHIFT/RSHIFT, LCTRL/RCTRL, LALT/RALT, LWIN/RWIN\n\
@@ -558,64 +455,6 @@ impl AppConfig {
              # trigger_key = \"JOYSTICK_046D_C21D_B1.0\"        # Logitech joystick button\n\
              # target_keys = [\"LBUTTON\"]                      # Left mouse click\n\
              # turbo_enabled = true                           # Enable turbo mode\n\n\
-             # ─── Sequence Input/Output Examples (Fighting Game Combos) ───\n\
-             # Sequence input triggers: Execute commands using input sequences\n\
-             # Format: trigger_sequence = \"Key1,Key2,Key3,...\"\n\
-             # - Keys are comma-separated (e.g., \"DOWN,RIGHT,A\")\n\
-             # - Time window defines max time to complete the sequence (default: 500ms)\n\
-             # - Supports keyboard keys, mouse buttons, mouse movements, and XInput stick/buttons\n\
-             # - Smart transition tolerance: DOWN->LEFT matches DOWN->DOWNLEFT->LEFT\n\
-             # - XInput diagonal bidirectional: DOWN_LEFT matches both DOWN->LEFT and LEFT->DOWN\n\
-             #\n\
-             # Sequence output targets: Send key sequences in order\n\
-             # Format: target_keys = [\"Key1\", \"Key2\", \"Key3\"]\n\
-             # - Set target_mode = 2 for sequential output\n\
-             # - interval controls delay between keys\n\
-             # - turbo_enabled = true: repeat entire sequence\n\
-             # - turbo_enabled = false: execute once per trigger\n\
-             #\n\
-             # Example 1: Hadoken (Quarter Circle Forward + Punch)\n\
-             # [[mappings]]\n\
-             # trigger_sequence = \"LS_Down,LS_DownRight,LS_Right,A\"  # ↓↘→+A\n\
-             # target_keys = [\"J\"]                                    # Press J\n\
-             # sequence_window_ms = 500                               # Complete within 500ms\n\
-             # turbo_enabled = true                                   # Repeat on hold\n\
-             #\n\
-             # Example 2: Shoryuken (Dragon Punch)\n\
-             # [[mappings]]\n\
-             # trigger_sequence = \"LS_Right,LS_Down,LS_DownRight,B\"   # →↓↘+B\n\
-             # target_keys = [\"K\"]\n\
-             # sequence_window_ms = 400\n\
-             # turbo_enabled = false                                  # Single execution\n\
-             #\n\
-             # Example 3: Keyboard combo (e.g., \"WASD\" sequence)\n\
-             # [[mappings]]\n\
-             # trigger_sequence = \"W,A,S,D\"                           # Press W-A-S-D in order\n\
-             # target_keys = [\"F\"]                                    # Output F\n\
-             # sequence_window_ms = 800\n\
-             # turbo_enabled = true\n\
-             #\n\
-             # Example 4: Mouse movement sequence (double tap direction)\n\
-             # [[mappings]]\n\
-             # trigger_sequence = \"MOUSE_LEFT,MOUSE_LEFT\"             # Double tap left\n\
-             # target_keys = [\"LSHIFT\"]                               # Activate sprint\n\
-             # sequence_window_ms = 300\n\
-             # turbo_enabled = false\n\
-             #\n\
-             # Example 5: Sequence output (macro)\n\
-             # [[mappings]]\n\
-             # trigger_key = \"F5\"                                     # Single key trigger\n\
-             # target_keys = [\"H\", \"E\", \"L\", \"L\", \"O\"]                # Type \"HELLO\"\n\
-             # target_mode = 2                                        # Sequential mode\n\
-             # interval = 50                                          # 50ms between keys\n\
-             # turbo_enabled = false                                  # Single execution\n\
-             #\n\
-             # Example 6: Complex combo (multiple sticks + buttons)\n\
-             # [[mappings]]\n\
-             # trigger_sequence = \"LS_Left,LS_DownLeft,LS_Down,LS_DownRight,LS_Right,LB+RB\"\n\
-             # target_keys = [\"SPACE\"]\n\
-             # sequence_window_ms = 600\n\
-             # turbo_enabled = false\n\n\
              # ─── HID Device Baselines (Auto-generated, Do Not Edit) ───\n\
              # This section is managed automatically by the application\n\
              # Device activation data for press/release detection\n\
@@ -632,20 +471,13 @@ impl AppConfig {
                 Language::SimplifiedChinese => "SimplifiedChinese",
                 Language::TraditionalChinese => "TraditionalChinese",
                 Language::Japanese => "Japanese",
-                Language::Korean => "Korean",
             },
             self.input_timeout,
             self.interval,
             self.event_duration,
             self.worker_count,
             self.xinput_capture_mode,
-            self.xinput_stick_deadzone,
-            self.xinput_trigger_threshold,
-            self.mouse_move_per_event_min_px,
-            self.mouse_move_min_trigger_px,
-            self.mouse_move_rearm_px,
             self.switch_key,
-            self.sequence_finalize_key,
             self.process_whitelist
         );
 
@@ -665,18 +497,6 @@ impl AppConfig {
                     mapping.trigger_key
                 ));
 
-                // Add trigger_sequence if present (for combo triggers)
-                if let Some(ref seq) = mapping.trigger_sequence {
-                    result.push_str(&format!(
-                        "trigger_sequence = \"{}\"    # Input sequence (e.g., \"A,S,D\")\n",
-                        seq
-                    ));
-                    result.push_str(&format!(
-                        "sequence_window_ms = {}       # Time window for sequence completion\n",
-                        mapping.sequence_window_ms
-                    ));
-                }
-
                 if mapping.target_keys.len() == 1 {
                     result.push_str("target_keys = [\"");
                     result.push_str(&mapping.target_keys[0]);
@@ -695,14 +515,6 @@ impl AppConfig {
                 } else {
                     result
                         .push_str("target_keys = []             # Keys that get repeatedly sent\n");
-                }
-
-                // Write target_mode only if not default (0 = Single)
-                if mapping.target_mode != 0 {
-                    result.push_str(&format!(
-                        "target_mode = {}              # 0=Single, 1=Multi, 2=Sequence\n",
-                        mapping.target_mode
-                    ));
                 }
 
                 if let Some(interval) = mapping.interval {
@@ -725,39 +537,75 @@ impl AppConfig {
                     "turbo_enabled = {}        # Enable turbo mode (true = auto-repeat, false = follow trigger press/release)\n",
                     mapping.turbo_enabled
                 ));
-
-                // Rule properties: only emit when non-empty. `None` and empty
-                // vectors keep the TOML clean so legacy configs stay lean.
-                if let Some(holds) = &mapping.hold_indices
-                    && !holds.is_empty()
-                {
-                    result.push_str("hold_indices = [");
-                    for (i, v) in holds.iter().enumerate() {
-                        if i > 0 {
-                            result.push_str(", ");
-                        }
-                        result.push_str(&v.to_string());
-                    }
-                    result
-                        .push_str("]          # Indices of target_keys to stay held after play\n");
+                if !mapping.note.is_empty() {
+                    result.push_str(&format!(
+                        "note = \"{}\"             # User note\n",
+                        mapping.note
+                    ));
                 }
-                if let Some(appends) = &mapping.append_keys
-                    && !appends.is_empty()
-                {
-                    result.push_str("append_keys = [");
-                    for (i, name) in appends.iter().enumerate() {
-                        if i > 0 {
-                            result.push_str(", ");
-                        }
-                        result.push('"');
-                        result.push_str(name);
-                        result.push('"');
-                    }
-                    result.push_str("]  # Extra keys pressed and held after play\n");
-                }
-
                 result.push('\n');
             }
+        }
+
+        // Append presets
+        if !self.presets.is_empty() {
+            result.push_str("# ─── Presets ───\n");
+            result.push_str("# Named mapping presets for quick switching\n");
+            for preset in &self.presets {
+                result.push_str("[[presets]]\n");
+                result.push_str(&format!("name = \"{}\"\n", preset.name));
+                if preset.mappings.is_empty() {
+                    result.push_str("mappings = []\n");
+                }
+                for mapping in &preset.mappings {
+                    result.push_str(&format!(
+                        "[[presets.mappings]]\n\
+                         trigger_key = \"{}\"\n",
+                        mapping.trigger_key
+                    ));
+                    if mapping.target_keys.len() == 1 {
+                        result.push_str(&format!(
+                            "target_keys = [\"{}\"]\n",
+                            mapping.target_keys[0]
+                        ));
+                    } else if mapping.target_keys.len() > 1 {
+                        result.push_str("target_keys = [");
+                        for (i, key) in mapping.target_keys.iter().enumerate() {
+                            if i > 0 {
+                                result.push_str(", ");
+                            }
+                            result.push('"');
+                            result.push_str(key);
+                            result.push('"');
+                        }
+                        result.push_str("]\n");
+                    }
+                    if let Some(interval) = mapping.interval {
+                        result.push_str(&format!("interval = {}\n", interval));
+                    }
+                    if let Some(duration) = mapping.event_duration {
+                        result.push_str(&format!("event_duration = {}\n", duration));
+                    }
+                    result.push_str(&format!("move_speed = {}\n", mapping.move_speed));
+                    result.push_str(&format!(
+                        "turbo_enabled = {}\n",
+                        mapping.turbo_enabled
+                    ));
+                    if !mapping.note.is_empty() {
+                        result.push_str(&format!("note = \"{}\"\n", mapping.note));
+                    }
+                }
+                result.push('\n');
+            }
+        }
+
+        // Append current_preset if set
+        if !self.current_preset.is_empty() {
+            result.push_str("# ─── Active Preset ───\n");
+            result.push_str(&format!(
+                "current_preset = \"{}\"\n\n",
+                self.current_preset
+            ));
         }
 
         // Append HID device baselines
@@ -990,11 +838,7 @@ mod tests {
             event_duration: Some(8),
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
+            note: String::new(),
         };
 
         assert_eq!(mapping.trigger_key, "A");
@@ -1012,11 +856,7 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
+            note: String::new(),
         };
 
         assert_eq!(mapping.trigger_key, "C");
@@ -1091,11 +931,7 @@ mod tests {
                 event_duration: Some(5),
                 turbo_enabled: true,
                 move_speed: 10,
-                target_mode: 0,
-                trigger_sequence: None,
-                sequence_window_ms: 500,
-                hold_indices: None,
-                append_keys: None,
+                note: String::new(),
             },
             KeyMapping {
                 trigger_key: "B".to_string(),
@@ -1104,11 +940,7 @@ mod tests {
                 event_duration: None,
                 turbo_enabled: true,
                 move_speed: 10,
-                target_mode: 0,
-                trigger_sequence: None,
-                sequence_window_ms: 500,
-                hold_indices: None,
-                append_keys: None,
+                note: String::new(),
             },
             KeyMapping {
                 trigger_key: "F1".to_string(),
@@ -1117,11 +949,7 @@ mod tests {
                 event_duration: Some(10),
                 turbo_enabled: true,
                 move_speed: 10,
-                target_mode: 0,
-                trigger_sequence: None,
-                sequence_window_ms: 500,
-                hold_indices: None,
-                append_keys: None,
+                note: String::new(),
             },
         ];
 
@@ -1326,11 +1154,7 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
+            note: String::new(),
         };
 
         assert_eq!(mapping.target_keys.len(), 1);
@@ -1346,11 +1170,7 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
+            note: String::new(),
         };
 
         assert_eq!(mapping.target_keys.len(), 2);
@@ -1366,11 +1186,7 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
+            note: String::new(),
         };
 
         assert_eq!(mapping.target_keys.len(), 0);
@@ -1386,11 +1202,7 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
+            note: String::new(),
         };
 
         mapping.add_target_key("C".to_string());
@@ -1403,6 +1215,28 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_target_key() {
+        let mut mapping = KeyMapping {
+            trigger_key: "A".to_string(),
+            target_keys: SmallVec::from_vec(vec![
+                "B".to_string(),
+                "C".to_string(),
+                "D".to_string(),
+            ]),
+            interval: None,
+            event_duration: None,
+            turbo_enabled: true,
+            move_speed: 10,
+            note: String::new(),
+        };
+
+        mapping.remove_target_key("C");
+        assert_eq!(mapping.target_keys.len(), 2);
+        assert_eq!(mapping.target_keys[0], "B");
+        assert_eq!(mapping.target_keys[1], "D");
+    }
+
+    #[test]
     fn test_clear_target_keys() {
         let mut mapping = KeyMapping {
             trigger_key: "A".to_string(),
@@ -1411,11 +1245,7 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
+            note: String::new(),
         };
 
         mapping.clear_target_keys();
@@ -1439,11 +1269,7 @@ mod tests {
                 event_duration: None,
                 turbo_enabled: true,
                 move_speed: 10,
-                target_mode: 0,
-                trigger_sequence: None,
-                sequence_window_ms: 500,
-                hold_indices: None,
-                append_keys: None,
+                note: String::new(),
             },
             KeyMapping {
                 trigger_key: "E".to_string(),
@@ -1455,11 +1281,7 @@ mod tests {
                 event_duration: None,
                 turbo_enabled: true,
                 move_speed: 10,
-                target_mode: 0,
-                trigger_sequence: None,
-                sequence_window_ms: 500,
-                hold_indices: None,
-                append_keys: None,
+                note: String::new(),
             },
         ];
 
@@ -1506,11 +1328,7 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
+            note: String::new(),
         };
 
         let keys = mapping.get_target_keys();
@@ -1532,12 +1350,8 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
-        }];
+            note: String::new(),
+         }];
 
         config.save_to_file(&path).expect("Failed to save config");
         let loaded_config = AppConfig::load_from_file(&path).expect("Failed to load config");
@@ -1568,12 +1382,8 @@ mod tests {
             event_duration: None,
             turbo_enabled: true,
             move_speed: 10,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
-        }];
+            note: String::new(),
+         }];
 
         config.save_to_file(&path).expect("Failed to save config");
         let loaded_config = AppConfig::load_from_file(&path).expect("Failed to load config");
@@ -1581,120 +1391,6 @@ mod tests {
         assert_eq!(loaded_config.mappings.len(), 1);
         assert_eq!(loaded_config.mappings[0].target_keys.len(), 6);
         assert_eq!(loaded_config.mappings[0].target_keys[5], "6");
-
-        cleanup_test_file(&path);
-    }
-
-    /// `hold_indices` and `append_keys` survive a
-    /// save/load cycle unchanged. Confirms serde keeps order and type.
-    #[test]
-    fn test_sequence_hold_fields_roundtrip() {
-        let path = get_test_config_path("sequence_hold_fields");
-        cleanup_test_file(&path);
-
-        let mut config = AppConfig::default();
-        config.mappings = vec![KeyMapping {
-            trigger_key: "F1".to_string(),
-            target_keys: SmallVec::from_vec(vec!["RIGHT".to_string(), "RIGHT".to_string()]),
-            interval: Some(5),
-            event_duration: Some(5),
-            turbo_enabled: false,
-            move_speed: 5,
-            target_mode: 2,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: Some(SmallVec::from_vec(vec![1u8])),
-            append_keys: Some(SmallVec::from_vec(vec![
-                "UP".to_string(),
-                "LSHIFT".to_string(),
-            ])),
-        }];
-
-        config.save_to_file(&path).expect("Failed to save config");
-        let loaded = AppConfig::load_from_file(&path).expect("Failed to load config");
-
-        assert_eq!(loaded.mappings.len(), 1);
-        let m = &loaded.mappings[0];
-        assert_eq!(
-            m.hold_indices.as_ref().map(|v| v.as_slice()),
-            Some([1u8].as_slice())
-        );
-        let append = m.append_keys.as_ref().unwrap();
-        assert_eq!(append.len(), 2);
-        assert_eq!(append[0], "UP");
-        assert_eq!(append[1], "LSHIFT");
-
-        cleanup_test_file(&path);
-    }
-
-    /// Omitted sequence hold / append fields round-trip as `None`, meaning
-    /// `skip_serializing_if` keeps legacy configs on the classic path.
-    #[test]
-    fn test_sequence_hold_fields_skip_when_none() {
-        let path = get_test_config_path("sequence_hold_fields_none");
-        cleanup_test_file(&path);
-
-        let mut config = AppConfig::default();
-        config.mappings = vec![KeyMapping {
-            trigger_key: "F1".to_string(),
-            target_keys: SmallVec::from_vec(vec!["A".to_string()]),
-            interval: None,
-            event_duration: None,
-            turbo_enabled: true,
-            move_speed: 5,
-            target_mode: 0,
-            trigger_sequence: None,
-            sequence_window_ms: 500,
-            hold_indices: None,
-            append_keys: None,
-        }];
-
-        config.save_to_file(&path).expect("Failed to save config");
-        let raw_toml =
-            std::fs::read_to_string(&path).expect("Failed to read config file for inspection");
-        // The doc header references both legacy and new names in comments,
-        // so match the assignment pattern instead of the bare word.
-        let has_hold_assignment = raw_toml
-            .lines()
-            .any(|line| !line.trim_start().starts_with('#') && line.contains("hold_indices ="));
-        let has_append_assignment = raw_toml
-            .lines()
-            .any(|line| !line.trim_start().starts_with('#') && line.contains("append_keys ="));
-        assert!(
-            !has_hold_assignment,
-            "Missing skip_serializing_if: serialized TOML should omit hold_indices when None, got:\n{raw_toml}"
-        );
-        assert!(
-            !has_append_assignment,
-            "Missing skip_serializing_if: serialized TOML should omit append_keys when None, got:\n{raw_toml}"
-        );
-
-        let loaded = AppConfig::load_from_file(&path).expect("Failed to load config");
-        assert!(loaded.mappings[0].hold_indices.is_none());
-        assert!(loaded.mappings[0].append_keys.is_none());
-
-        cleanup_test_file(&path);
-    }
-
-    /// A malformed config file resets to defaults rather than failing.
-    /// The default config gets written back to disk so the next launch
-    /// reads a clean state.
-    #[test]
-    fn test_load_or_create_resets_on_malformed_file() {
-        let path = get_test_config_path("malformed_reset");
-        cleanup_test_file(&path);
-
-        std::fs::write(&path, "this is = not valid = toml\n[[mappings\n").unwrap();
-        let loaded = AppConfig::load_or_create(&path).expect("should recover to defaults");
-
-        // Defaults resurface.
-        let default_cfg = AppConfig::default();
-        assert_eq!(loaded.switch_key, default_cfg.switch_key);
-        assert_eq!(loaded.mappings.len(), default_cfg.mappings.len());
-
-        // The file on disk now parses cleanly on a second read.
-        let second = AppConfig::load_from_file(&path).expect("rewritten file should parse");
-        assert_eq!(second.switch_key, default_cfg.switch_key);
 
         cleanup_test_file(&path);
     }
